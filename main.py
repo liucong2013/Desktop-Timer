@@ -1,232 +1,253 @@
 import sys
-import json
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QMenu
-from PyQt6.QtCore import Qt, QTimer, QRect, QPoint
-from PyQt6.QtGui import QIcon, QAction
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+from PyQt6.QtCore import Qt, QTimer, QPoint, QRect, QSize
+from PyQt6.QtGui import QAction, QCursor, QScreen, QGuiApplication
 from pynput import keyboard, mouse
+import time
 
-class MainWindow(QMainWindow):
+class DesktopTimer(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Desktop Timer")
-        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+        self.initUI()
+        self.initCounters()
+        self.initKeyboardListener()
+        self.initMouseListener()
+        self.edge_buffer = 20
+        self.original_size = None
+        self.original_stats_hidden_size = None
+        self.stats_visible = False
+        self.just_started = True  # 新增：标记程序是否刚启动
+
+    def initUI(self):
+        self.setWindowTitle('Desktop Timer')
+        self.setGeometry(100, 100, 70, 25)
         
-        # 创建中央部件和布局
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
-        
-        # 创建左侧布局（用于暂停/启动按钮）
-        left_layout = QVBoxLayout()
-        self.pause_button = QPushButton()
-        self.pause_button.setIcon(QIcon("pause.png"))  # 请确保有一个 pause.png 文件
-        self.pause_button.setFixedSize(30, 30)
-        self.pause_button.clicked.connect(self.toggle_pause)
-        left_layout.addWidget(self.pause_button)
-        left_layout.addStretch()
-        
-        # 创建右侧布局（用于计时器和统计信息）
-        right_layout = QVBoxLayout()
-        
-        # 创建计时器标签
-        self.timer_label = QLabel("00:00:00")
+        main_layout.setContentsMargins(1, 1, 1, 1)
+
+        self.pause_button = QPushButton("⏸️", self)
+        self.pause_button.setFixedSize(20, 20)
+        self.pause_button.clicked.connect(self.togglePause)
+        main_layout.addWidget(self.pause_button)
+
+        self.timer_label = QLabel('00:00:00', self)
         self.timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        right_layout.addWidget(self.timer_label)
-        
-        # 创建统计信息标签
-        self.stats_label = QLabel("键盘: 0 | 鼠标: 0 | 空闲: 00:00:00")
+        self.timer_label.setStyleSheet("font-size: 12px;")
+        main_layout.addWidget(self.timer_label)
+
+        self.stats_label = QLabel('', self)
         self.stats_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.stats_label.hide()
-        right_layout.addWidget(self.stats_label)
-        
-        # 将左侧和右侧布局添加到主布局
-        main_layout.addLayout(left_layout)
-        main_layout.addLayout(right_layout)
-        
-        # 设置计时器
+
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_timer)
-        self.timer.start(1000)  # 每秒更新一次
-        
-        self.seconds = 0
+        self.timer.timeout.connect(self.updateTimer)
+        self.timer.start(1000)
+
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        self.addAction(QAction("关闭程序", self, triggered=self.close))
+        self.toggle_seconds_action = QAction("隐藏秒数", self, triggered=self.toggleSeconds)
+        self.addAction(self.toggle_seconds_action)
+        self.toggle_topmost_action = QAction("取消置顶", self, triggered=self.toggleTopmost)
+        self.addAction(self.toggle_topmost_action)
+
         self.show_seconds = True
-        self.always_on_top = True
-        self.is_minimized = False
+        self.is_topmost = True
         self.is_paused = False
+        self.is_minimized = False
+
+        self.dragging = False
+        self.offset = QPoint()
+
+        self.original_size = QSize(91, 30)  # 设置一个固定的初始大小
+        self.original_compact_size = QSize(91, 30)
+
+        # 将窗口移动到右下角
+        self.moveToBottomRight()
         
-        # 键盘和鼠标计数器
+        QTimer.singleShot(1000, self.setJustStartedFalse)  # 1秒后将just_started设为False
+
+    def setJustStartedFalse(self):
+        self.just_started = False
+
+    def initCounters(self):
+        self.seconds = 0
         self.keyboard_count = 0
         self.mouse_count = 0
-        self.idle_seconds = 0
-        self.last_activity_time = 0
-        
-        # 创建右键菜单
-        self.create_context_menu()
-        
-        # 设置窗口大小和位置
-        self.normal_size = QRect(100, 100, 200, 100)
-        self.setGeometry(self.normal_size)
-        
-        # 设置键盘和鼠标监听器
+        self.idle_time = 0
+        self.last_activity_time = time.time()
+
+    def initKeyboardListener(self):
         self.keyboard_listener = keyboard.Listener(on_press=self.on_key_press)
-        self.mouse_listener = mouse.Listener(on_click=self.on_mouse_click)
         self.keyboard_listener.start()
+
+    def initMouseListener(self):
+        self.mouse_listener = mouse.Listener(on_click=self.on_mouse_click)
         self.mouse_listener.start()
-        
-        # 加载设置
-        self.load_settings()
-        
-    def update_timer(self):
+
+    def updateTimer(self):
         if not self.is_paused:
             self.seconds += 1
-            self.update_idle_time()
+            self.checkIdleTime()
         hours, remainder = divmod(self.seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         if self.show_seconds:
-            self.timer_label.setText(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+            time_str = f'{hours:02d}:{minutes:02d}:{seconds:02d}'
         else:
-            self.timer_label.setText(f"{hours:02d}:{minutes:02d}")
-        
-        # 更新统计信息
-        idle_hours, idle_remainder = divmod(self.idle_seconds, 3600)
-        idle_minutes, idle_seconds = divmod(idle_remainder, 60)
-        self.stats_label.setText(f"键盘: {self.keyboard_count} | 鼠标: {self.mouse_count} | 空闲: {idle_hours:02d}:{idle_minutes:02d}:{idle_seconds:02d}")
+            time_str = f'{hours:02d}:{minutes:02d}'
+        self.timer_label.setText(time_str)
 
-    def create_context_menu(self):
-        self.context_menu = QMenu(self)
-        
-        # 关闭程序选项
-        close_action = QAction("关闭程序", self)
-        close_action.triggered.connect(self.close)
-        self.context_menu.addAction(close_action)
-        
-        # 显示/隐藏秒数选项
-        self.toggle_seconds_action = QAction("隐藏秒数", self)
-        self.toggle_seconds_action.triggered.connect(self.toggle_seconds)
-        self.context_menu.addAction(self.toggle_seconds_action)
-        
-        # 切换始终置顶选项
-        self.toggle_on_top_action = QAction("取消置顶", self)
-        self.toggle_on_top_action.triggered.connect(self.toggle_always_on_top)
-        self.context_menu.addAction(self.toggle_on_top_action)
-
-    def contextMenuEvent(self, event):
-        self.context_menu.exec(event.globalPos())
-
-    def toggle_seconds(self):
+    def toggleSeconds(self):
         self.show_seconds = not self.show_seconds
         self.toggle_seconds_action.setText("显示秒数" if self.show_seconds else "隐藏秒数")
-        self.update_timer()
-        self.save_settings()
+        self.updateTimer()
 
-    def toggle_always_on_top(self):
-        self.always_on_top = not self.always_on_top
-        if self.always_on_top:
+    def toggleTopmost(self):
+        self.is_topmost = not self.is_topmost
+        if self.is_topmost:
             self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
-            self.toggle_on_top_action.setText("取消置顶")
+            self.toggle_topmost_action.setText("取消置顶")
         else:
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowStaysOnTopHint)
-            self.toggle_on_top_action.setText("始终置顶")
-        self.show()  # 需要重新显示窗口以应用更改
-        self.save_settings()
+            self.toggle_topmost_action.setText("始终置顶")
+        self.show()
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            if not self.stats_label.isVisible():
-                self.stats_label.show()
-            else:
-                self.stats_label.hide()
-            event.accept()
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.MouseButton.LeftButton:
-            self.move(event.globalPosition().toPoint() - self.drag_position)
-            self.check_edge_proximity()
-            event.accept()
-
-    def check_edge_proximity(self):
-        screen = QApplication.primaryScreen().geometry()
-        window_rect = self.geometry()
-        
-        # 检查是否靠近屏幕边缘
-        if (window_rect.left() <= 10 or 
-            window_rect.right() >= screen.width() - 10 or 
-            window_rect.top() <= 10 or 
-            window_rect.bottom() >= screen.height() - 10):
-            if not self.is_minimized:
-                self.minimize_window()
-        else:
-            if self.is_minimized:
-                self.restore_window()
-
-    def minimize_window(self):
-        self.normal_size = self.geometry()
-        self.setFixedSize(10, 100)
-        self.is_minimized = True
-        self.pause_button.hide()
-
-    def restore_window(self):
-        self.setGeometry(self.normal_size)
-        self.is_minimized = False
-        self.pause_button.show()
+    def togglePause(self):
+        self.is_paused = not self.is_paused
+        self.pause_button.setText("▶️" if self.is_paused else "⏸️")
 
     def on_key_press(self, key):
         if not self.is_paused:
             self.keyboard_count += 1
-            self.last_activity_time = self.seconds
+            self.last_activity_time = time.time()
 
     def on_mouse_click(self, x, y, button, pressed):
         if not self.is_paused and pressed:
             self.mouse_count += 1
-            self.last_activity_time = self.seconds
+            self.last_activity_time = time.time()
 
-    def update_idle_time(self):
-        if self.seconds - self.last_activity_time >= 20:
-            self.idle_seconds += 1
+    def checkIdleTime(self):
+        current_time = time.time()
+        if current_time - self.last_activity_time > 20:
+            self.idle_time += 1
 
-    def toggle_pause(self):
-        self.is_paused = not self.is_paused
-        if self.is_paused:
-            self.pause_button.setIcon(QIcon("play.png"))  # 请确保有一个 play.png 文件
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if not self.dragging:
+                self.toggleStatsDisplay()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            if not self.dragging:
+                self.dragging = True
+                self.drag_start_position = event.globalPosition().toPoint()
+                self.window_start_position = self.pos()
+            else:
+                new_pos = self.window_start_position + event.globalPosition().toPoint() - self.drag_start_position
+                screen = QApplication.screenAt(new_pos)
+                if screen:
+                    screen_geometry = screen.availableGeometry()
+                    
+                    if not self.just_started:  # 只有在不是刚启动时才检查边缘
+                        edge = self.getTouchedEdge(screen_geometry, new_pos)
+                        if edge and not self.is_minimized:
+                            self.minimizeWindow(screen_geometry, edge)
+                        elif not edge and self.is_minimized:
+                            self.restoreWindow()
+                    
+                    new_pos.setX(max(screen_geometry.left(), min(new_pos.x(), screen_geometry.right() - self.width())))
+                    new_pos.setY(max(screen_geometry.top(), min(new_pos.y(), screen_geometry.bottom() - self.height())))
+                    self.move(new_pos)
+        
+        super().mouseMoveEvent(event)
+
+    def getTouchedEdge(self, screen, pos):
+        threshold = 20  # 增加阈值
+        if pos.x() <= screen.left() + threshold:
+            return 'left'
+        elif pos.x() + self.width() >= screen.right() - threshold:
+            return 'right'
+        elif pos.y() <= screen.top() + threshold:
+            return 'top'
+        elif pos.y() + self.height() >= screen.bottom() - threshold:
+            return 'bottom'
+        return None
+
+    def minimizeWindow(self, screen, edge):
+        if not self.is_minimized:
+            self.is_minimized = True
+            self.original_size = self.size()
+            self.original_pos = self.pos()
+            if edge in ['left', 'right']:
+                self.setGeometry(self.x(), self.y(), 5, 50)
+            else:
+                self.setGeometry(self.x(), self.y(), 50, 5)
+            print(f"Window minimized to {edge}. New size: {self.size()}")  # 调试信息
+
+    def restoreWindow(self):
+        if self.is_minimized:
+            self.is_minimized = False
+            self.resize(self.original_size)
+            self.move(self.original_pos)
+            print(f"Window restored. New size: {self.size()}")  # 调试信息
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = False
+        super().mouseReleaseEvent(event)
+
+    def toggleStatsDisplay(self):
+        if not self.stats_visible:
+            self.stats_visible = True
+            idle_hours, idle_remainder = divmod(self.idle_time, 3600)
+            idle_minutes, idle_seconds = divmod(idle_remainder, 60)
+            stats = (f"键盘: {self.keyboard_count:6d}\n"
+                     f"鼠标: {self.mouse_count:6d}\n"
+                     f"空闲: {idle_hours:02d}:{idle_minutes:02d}:{idle_seconds:02d}")
+            self.stats_label.setText(stats)
+            
+            self.original_compact_size = self.size()
+            
+            self.stats_label.setStyleSheet("font-size: 14px; padding: 5px;")
+            
+            self.centralWidget().layout().addWidget(self.stats_label)
+            self.stats_label.show()
+            
+            self.adjustSize()
+            print(f"显示统计信息 - 原始大小: {self.original_compact_size}, 新大小: {self.size()}")
         else:
-            self.pause_button.setIcon(QIcon("pause.png"))
+            self.stats_visible = False
+            self.stats_label.hide()
+            
+            self.centralWidget().layout().removeWidget(self.stats_label)
+            
+            self.resize(self.original_compact_size)
+            print(f"隐藏统计信息 - 恢复到原始大小: {self.original_compact_size}")
 
-    def save_settings(self):
-        settings = {
-            "show_seconds": self.show_seconds,
-            "always_on_top": self.always_on_top,
-            "window_position": [self.pos().x(), self.pos().y()],
-            "window_size": [self.width(), self.height()],
-        }
-        with open("settings.json", "w") as f:
-            json.dump(settings, f)
+        self.original_size = self.size()
 
-    def load_settings(self):
-        try:
-            with open("settings.json", "r") as f:
-                settings = json.load(f)
-            self.show_seconds = settings.get("show_seconds", True)
-            self.always_on_top = settings.get("always_on_top", True)
-            position = settings.get("window_position", [100, 100])
-            size = settings.get("window_size", [200, 100])
-            self.setGeometry(QRect(QPoint(position[0], position[1]), QPoint(position[0] + size[0], position[1] + size[1])))
-            self.toggle_seconds_action.setText("显示秒数" if not self.show_seconds else "隐藏秒数")
-            self.toggle_on_top_action.setText("取消置顶" if self.always_on_top else "始终置顶")
-            if not self.always_on_top:
-                self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowStaysOnTopHint)
-        except FileNotFoundError:
-            pass
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self.stats_visible and not self.is_minimized:
+            self.original_compact_size = self.size()
 
-    def closeEvent(self, event):
-        self.save_settings()
-        event.accept()
+    def moveToBottomRight(self):
+        screen = QGuiApplication.primaryScreen().availableGeometry()
+        
+        window_width = self.width()
+        window_height = self.height()
+        
+        x = screen.width() - window_width - 10  # 10是与屏幕右边缘的间距
+        y = screen.height() - window_height - 10  # 10是与屏幕底部的间距
+        
+        self.move(screen.left() + x, screen.top() + y)
 
-def main():
+if __name__ == '__main__':
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
+    timer = DesktopTimer()
+    timer.show()
     sys.exit(app.exec())
-
-if __name__ == "__main__":
-    main()
