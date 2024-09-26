@@ -1,4 +1,15 @@
+# 
+
+## 项目前言
+
+本项目用于测试cursor的智能性
+
+
+
 # Desktop Timer
+
+
+
 
 Desktop Timer 是一个基于 Python 和 PyQt6 开发的桌面应用程序，提供计时器功能和其他实用工具。
 
